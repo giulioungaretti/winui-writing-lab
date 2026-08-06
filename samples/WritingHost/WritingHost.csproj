@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType><TargetFramework>net10.0-windows10.0.22621.0</TargetFramework><TargetPlatformMinVersion>10.0.22621.0</TargetPlatformMinVersion>
+    <RootNamespace>WritingHost</RootNamespace><ApplicationManifest>app.manifest</ApplicationManifest><UseWinUI>true</UseWinUI><WinUISDKReferences>false</WinUISDKReferences>
+    <WindowsPackageType>None</WindowsPackageType><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7175" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.251106002" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Ink.WinUI\Ink.WinUI.csproj" />
+    <ProjectReference Include="..\..\src\RichText.WinUI\RichText.WinUI.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="Assets\demo-sketch.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

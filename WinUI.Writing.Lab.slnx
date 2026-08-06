@@ -1,0 +1,20 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/InputLatency/InputLatency.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/InkHost/InkHost.csproj" />
+    <Project Path="samples/RichTextHost/RichTextHost.csproj" />
+    <Project Path="samples/WritingHost/WritingHost.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Ink.Core/Ink.Core.csproj" />
+    <Project Path="src/Ink.WinUI/Ink.WinUI.csproj" />
+    <Project Path="src/RichText.Core/RichText.Core.csproj" />
+    <Project Path="src/RichText.WinUI/RichText.WinUI.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Ink.Core.Tests/Ink.Core.Tests.csproj" />
+    <Project Path="tests/RichText.Core.Tests/RichText.Core.Tests.csproj" />
+  </Folder>
+</Solution>

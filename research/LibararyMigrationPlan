@@ -1,0 +1,14 @@
+# Migrate Legacty lib 
+We have a library in the folder ./lib, called atrament.
+
+We are using in the ./ink app as a pacakge from NPM.
+
+We want to modernize the library to use modern typescript.
+
+Follow the following steps running in a sub agents in prallel as much as possible and commit the changes for each step
+- documentation: add the missing documentation to the js files
+- test: create a comprehensive test suite that we can use to check that our new implementation is 100% the same as the old one
+- make a plan to re write the lib in typescript:
+    - it is OK to come up with a better API that's more idiomatic for typescript
+    - document the changes
+- implement the new lib in a lib_ts folder 

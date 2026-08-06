@@ -1,0 +1,17 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.pfx
+*.appx
+*.msix
+*.msixbundle
+AppPackages/
+TestResults/
+tests/WritingHost.UITests/artifacts/
+tests/WritingHost.UITests/recordings/
+tests/WritingHost.UITests/screenshots/
+*.mp4
+*.tmp
+*.temp
