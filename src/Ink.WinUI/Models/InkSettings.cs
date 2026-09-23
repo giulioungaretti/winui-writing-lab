@@ -8,14 +8,9 @@ namespace InkControl.Models;
 public sealed record InkSettings
 {
     /// <summary>
-    /// Default pen thickness in pixels.
+    /// Default pen thickness in world-space DIPs.
     /// </summary>
     public const double DefaultPenThickness = 2.0;
-
-    /// <summary>
-    /// Default eraser radius in pixels.
-    /// </summary>
-    public const double DefaultEraserRadius = 10.0;
 
     /// <summary>
     /// Pen color.
@@ -23,14 +18,9 @@ public sealed record InkSettings
     public Color PenColor { get; init; } = Microsoft.UI.Colors.Black;
 
     /// <summary>
-    /// Pen stroke thickness in pixels.
+    /// Pen stroke thickness in world-space DIPs. The native engine owns whole-stroke erasing.
     /// </summary>
     public double PenThickness { get; init; } = DefaultPenThickness;
-
-    /// <summary>
-    /// Eraser radius in pixels.
-    /// </summary>
-    public double EraserRadius { get; init; } = DefaultEraserRadius;
 
     /// <summary>
     /// Default ink settings (black pen, 2px thickness).

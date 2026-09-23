@@ -44,5 +44,12 @@ public sealed partial class MainWindow : Window
     private void InkCanvas_ViewportChanged(object sender, ViewportChangedEventArgs e)
     {
         ZoomText.Text = $"{e.Zoom * 100:F0}%";
+        StatusText.Text = $"Pan: {e.PanX:F0}, {e.PanY:F0} DIPs";
+    }
+
+    private void InkCanvas_StrokesChanged(object? sender, EventArgs e)
+    {
+        if (StatusText is not null)
+            StatusText.Text = $"Ink: {InkCanvas.GetStrokes().Strokes.Count} strokes";
     }
 }

@@ -5,12 +5,12 @@ A focused C#/WinUI 3 research workspace for reusable ink input/rendering and blo
 ## Layout
 
 - `src/Ink.Core` — platform-neutral stroke, geometry, viewport, and input processing.
-- `src/Ink.WinUI` — reusable `InkControl` WinUI renderer/control.
+- `src/Ink.WinUI` — reusable `InkControl` wrapping native WinAppSDK `InkCanvas` and `InkToolbar`.
 - `src/RichText.Core` — document model, parsers, and text renderers.
 - `src/RichText.WinUI` — archived reusable rich-text controls, services, and view models.
 - `tests` — migrated core tests.
 - `tests/WritingHost.UITests` — WinApp CLI (`winapp`) UI smoke test driving the combined host via UI Automation.
-- `samples` — small hosts for the ink and rich-text controls, plus `WritingHost`, a combined host with the rich-text editor and low-latency ink canvas side by side.
+- `samples` — small hosts for the ink and rich-text controls, plus `WritingHost`, a combined host with the rich-text editor and native infinite ink canvas side by side.
 - `benchmarks/InputLatency` — Win2D pointer-to-render latency experiment.
 - `research` — selected architecture/performance notes only (no TypeScript application code).
 - `provenance/SESSION-STATE.md` — sources, current archive locations, revisions, scope, and migration decisions.
@@ -19,9 +19,11 @@ A focused C#/WinUI 3 research workspace for reusable ink input/rendering and blo
 ## Build and test
 
 ```powershell
-dotnet build WinUI.Writing.Lab.slnx
+dotnet build WinUI.Writing.Lab.slnx -p:Platform=x64
+dotnet build samples\WritingHost\WritingHost.csproj -p:Platform=x64
 dotnet build benchmarks\InputLatency\InputLatency.csproj -p:Platform=x64
 dotnet test tests\Ink.Core.Tests\Ink.Core.Tests.csproj
+dotnet test tests\Ink.Native.Tests\Ink.Native.Tests.csproj
 dotnet test tests\RichText.Core.Tests\RichText.Core.Tests.csproj
 ```
 
@@ -39,6 +41,48 @@ The smoke test builds and launches `WritingHost`, then drives it through UIA: `i
 
 Known limitation: `winapp ui pen` / `ui touch` raw input injection mistargets on mixed-DPI multi-monitor setups (strokes land in the wrong coordinate space; `ui inspect` reports physical per-monitor pixels while injection consumes a different space). UIA patterns and mouse `click`/`hover` are DPI-safe. Run pen/touch gesture tests on a single-monitor or 100%-scaling machine (e.g. a CI VM); `winapp ui record` can capture MP4 evidence there.
 
-The WinUI projects retain their source target frameworks and package versions: ink remains on .NET 10 / Windows App SDK 1.8; rich text and InputLatency remain on .NET 8 / Windows App SDK 1.8. The sample hosts use `WindowsPackageType=None` solely to make this research repository build unpackaged without signing or packaging output. Build with `Platform=x64` because Win2D cannot be referenced correctly as AnyCPU. UI-test artifacts (screenshots, recordings, and temporary output) are ignored.
+The ink and rich-text libraries and their sample hosts use Windows App SDK **2.4.1-experimental**.
+Ink targets .NET 10 / Windows 11 (22621); rich text retains its .NET 8 target. The independent
+`InputLatency` Win2D benchmark remains on .NET 8 / Windows App SDK 1.8 and is not the ink backend.
+The sample hosts use `WindowsPackageType=None` and `WindowsAppSDKSelfContained=true`: their build
+output includes the matching experimental Windows runtime, so no system-wide installation is needed.
+The matching .NET runtime is still required. Build with `Platform=x64` (including the Win2D benchmark).
+UI-test artifacts are ignored. `WritingHost.log` beside the executable records unhandled errors without
+suppressing them.
+
+## Native infinite canvas
+
+All live and completed ink is rendered by `Microsoft.UI.Xaml.Controls.InkCanvas.InkPresenter`.
+There is no Vortice renderer, swap chain, independent app render loop, custom drying, or fallback backend.
+The built-in toolbar offers a ballpoint pen, native whole-stroke erasing, and a pan tool; pencil and
+highlighter are deliberately omitted because the existing `INKS` format does not represent those brushes.
+
+- Draw with a pen, or the left mouse button in the samples. Reusable controls opt into mouse drawing
+  with `IsMouseInkingEnabled="True"`; touch is always reserved for navigation.
+- Pan with the pan tool, right-mouse drag, pen barrel-button drag, one-finger touch, or the wheel.
+  Shift+wheel pans horizontally. Touch dragging does not add ink.
+- Pinch, Ctrl+wheel, or the zoom buttons zoom between 25% and 800%. Pointer/pinch zoom preserves
+  the world point under the gesture; button zoom uses the viewport center. Reset returns to the origin.
+- Pan has no document-edge clamp. Strokes retain world coordinates, including negative coordinates;
+  the native surface stays viewport-sized. Each native stroke has an absolute point transform from
+  its capture space to the current view, and its pen width is scaled separately. Navigation is
+  coalesced to a composition frame and deferred while a stroke is being collected.
+- Ruled/dotted paper is a separate clipped XAML layer anchored to the same world coordinates.
+  Dense patterns are thinned at low zoom; paper rendering is bounded by viewport size.
+- `GetStrokes`/`SetStrokes`, `Clear`, `ExportAsync`/`ImportAsync` and their existing aliases remain.
+  `INKS` v1/v2 data and GUIDs stay authoritative. Native IDs and boot-relative timestamps are adapted,
+  not substituted into the persisted format. The OS owns eraser hit behavior; the old custom
+  `EraserRadius` setting and interpolation modes have been removed.
+
+`Ink.Native.Tests` exercises the actual Windows ink point/stroke objects and production adapter/
+serializer source without needing a XAML application: projected coordinates, pen width, eraser
+selection geometry, timestamp conversion, repeated navigation, GUID preservation and v1/v2 data.
+`Ink.Core.Tests` continues to cover the platform-neutral geometry and historical input processor.
+
+This is an unsupported experimental SDK, pinned intentionally. The August 25 package predates the
+custom-drying API and presenter-size DPI correction in
+[microsoft/microsoft-ui-xaml#11801](https://github.com/microsoft/microsoft-ui-xaml/pull/11801).
+The app clips ink to its viewport, but does not patch the SDK or claim to remove that upstream DPI issue.
+Full brush fidelity and physical pen/touch behavior remain dependent on this experimental runtime.
 
 Excluded deliberately: notebook/timeline/task models, mobile/server/Aspire, persistence and product shell code, package artifacts, and TypeScript application code.

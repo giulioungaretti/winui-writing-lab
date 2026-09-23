@@ -7,7 +7,47 @@
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d">
 
-    <Grid x:Name="RootGrid" Background="Transparent">
-        <!-- SwapChainPanel will be dynamically created and added here -->
+    <Grid x:Name="RootGrid">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <InkToolbar x:Name="Toolbar"
+                        InitialControls="None"
+                        HorizontalAlignment="Left"
+                        TargetInkCanvas="{x:Bind NativeCanvas}">
+                <InkToolbarBallpointPenButton x:Name="PenButton"
+                                             MinStrokeWidth="0.1"
+                                             MaxStrokeWidth="100"
+                                             SelectedStrokeWidth="2" />
+                <InkToolbarEraserButton x:Name="EraserButton"
+                                       SelectedEraser="Stroke"
+                                       IsStrokeEraserVisible="True"
+                                       ArePrecisionErasersVisible="False" />
+                <InkToolbarCustomToolButton x:Name="PanButton"
+                                            AutomationProperties.Name="Pan canvas"
+                                            ToolTipService.ToolTip="Pan canvas">
+                    <FontIcon Glyph="&#xE7C9;" />
+                </InkToolbarCustomToolButton>
+            </InkToolbar>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4" Margin="8,4">
+                <Button x:Name="ZoomOutButton" Content="&#x2212;" Click="ZoomOut_Click"
+                        AutomationProperties.Name="Zoom out" ToolTipService.ToolTip="Zoom out" />
+                <Button x:Name="ZoomInButton" Content="+" Click="ZoomIn_Click"
+                        AutomationProperties.Name="Zoom in" ToolTipService.ToolTip="Zoom in" />
+            </StackPanel>
+        </Grid>
+        <Grid x:Name="ViewportGrid" Grid.Row="1" Background="White">
+            <Grid.Clip>
+                <RectangleGeometry x:Name="ViewportClip" />
+            </Grid.Clip>
+            <Path x:Name="BackgroundPattern" IsHitTestVisible="False" />
+            <InkCanvas x:Name="NativeCanvas" AutomationProperties.Name="Infinite ink canvas" />
+        </Grid>
     </Grid>
 </UserControl>

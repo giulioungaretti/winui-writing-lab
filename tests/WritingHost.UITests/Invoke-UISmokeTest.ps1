@@ -47,11 +47,11 @@ if ($version -lt [Version]'0.5.0') { throw "winapp $version found; v0.5.0+ requi
 
 # --- Build & launch ----------------------------------------------------------
 Write-Host "Building $app..."
-dotnet build "$repoRoot\samples\WritingHost\WritingHost.csproj" --nologo -v q
+dotnet build "$repoRoot\samples\WritingHost\WritingHost.csproj" -c $Configuration -p:Platform=x64 --nologo -v q
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 
-$exe = Get-ChildItem "$repoRoot\samples\WritingHost\bin\$Configuration" -Recurse -Filter WritingHost.exe | Select-Object -First 1
-if (-not $exe) { throw "WritingHost.exe not found under bin\$Configuration" }
+$exe = Get-ChildItem "$repoRoot\samples\WritingHost\bin\x64\$Configuration" -Recurse -Filter WritingHost.exe | Select-Object -First 1
+if (-not $exe) { throw "WritingHost.exe not found under bin\x64\$Configuration" }
 
 $existing = Get-Process $app -ErrorAction SilentlyContinue
 if ($existing) { $existing | ForEach-Object { Stop-Process -Id $_.Id }; Start-Sleep 2 }

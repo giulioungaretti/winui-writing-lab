@@ -15,6 +15,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Ink.Core.Tests/Ink.Core.Tests.csproj" />
+    <Project Path="tests/Ink.Native.Tests/Ink.Native.Tests.csproj" />
     <Project Path="tests/RichText.Core.Tests/RichText.Core.Tests.csproj" />
   </Folder>
 </Solution>
