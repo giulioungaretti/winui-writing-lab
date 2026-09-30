@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.22621.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.0">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Ink.Core\Ink.Core.csproj" />
+    <!-- Exercise the actual Windows ink model without requiring a XAML application host. -->
+    <Compile Include="..\..\src\Ink.WinUI\Models\NativeStrokeAdapter.cs" Link="NativeStrokeAdapter.cs" />
+    <Compile Include="..\..\src\Ink.WinUI\Models\StrokeSerializer.cs" Link="StrokeSerializer.cs" />
+    <Compile Include="..\..\src\Ink.WinUI\Input\ColorExtensions.cs" Link="ColorExtensions.cs" />
+  </ItemGroup>
+</Project>

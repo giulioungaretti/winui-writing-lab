@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Verifies real synthetic-pen inking end-to-end: injects pen strokes
-    (with pressure) onto the low-latency D2D ink canvas, records the session
+    (with pressure) onto the native WinAppSDK ink canvas, records the session
     to MP4, and asserts that pixels in the canvas region actually changed.
 
     winapp `ui pen`/`ui touch` injection mistargets on mixed-DPI multi-monitor
@@ -59,10 +59,11 @@ if ([Version](winapp --version) -lt [Version]'0.5.0') { throw 'winapp v0.5.0+ re
 
 # --- Build & launch ----------------------------------------------------------
 Write-Host "Building $app..."
-dotnet build "$repoRoot\samples\WritingHost\WritingHost.csproj" --nologo -v q
+dotnet build "$repoRoot\samples\WritingHost\WritingHost.csproj" -c $Configuration -p:Platform=x64 --nologo -v q
 if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 
-$exe = Get-ChildItem "$repoRoot\samples\WritingHost\bin\$Configuration" -Recurse -Filter WritingHost.exe | Select-Object -First 1
+$exe = Get-ChildItem "$repoRoot\samples\WritingHost\bin\x64\$Configuration" -Recurse -Filter WritingHost.exe | Select-Object -First 1
+if (-not $exe) { throw "WritingHost.exe not found under bin\x64\$Configuration" }
 Get-Process $app -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id }
 Start-Sleep 1
 $proc = Start-Process $exe.FullName -PassThru

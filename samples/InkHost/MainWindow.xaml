@@ -60,12 +60,14 @@
                        BgType="Blank"
                        BgSpacing="25"
                        PenThickness="2"
+                       IsMouseInkingEnabled="True"
+                       StrokesChanged="InkCanvas_StrokesChanged"
                        ViewportChanged="InkCanvas_ViewportChanged" />
 
         <!-- Status Bar -->
         <Grid Grid.Row="2" Padding="12,8" Background="{ThemeResource LayerFillColorDefaultBrush}">
             <StackPanel Orientation="Horizontal" Spacing="16">
-                <TextBlock x:Name="StatusText" Text="Ready - Draw with pen or touch" 
+                <TextBlock x:Name="StatusText" Text="Draw with pen or mouse; touch or right-drag to pan"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 <TextBlock Text="•" Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
                 <TextBlock Text="Ctrl+Wheel to zoom, Wheel to scroll" 

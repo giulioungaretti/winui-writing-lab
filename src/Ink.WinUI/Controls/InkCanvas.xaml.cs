@@ -1,563 +1,543 @@
-using System;
-using System.Linq;
 using System.Numerics;
-using System.Runtime.InteropServices;
-using System.Threading.Tasks;
 using InkControl.Input;
 using InkControl.Models;
-using InkControl.Rendering;
 using inkapp.Core.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.UI.Xaml;
-using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
-using Vortice.Mathematics;
-using WinRT;
-using StrokeSerializer = InkControl.Models.StrokeSerializer;
+using Microsoft.UI.Xaml.Media;
+using Windows.Foundation;
+using Windows.UI;
+using Windows.UI.Core;
+using InkDrawingAttributes = Windows.UI.Input.Inking.InkDrawingAttributes;
+using NativeInkPresenter = Microsoft.UI.Xaml.Controls.InkPresenter;
+using NativeInkStroke = Windows.UI.Input.Inking.InkStroke;
+using NativeProcessingMode = Microsoft.UI.Xaml.Controls.InkInputProcessingMode;
+using PointerDeviceType = Microsoft.UI.Input.PointerDeviceType;
 
 namespace InkControl.Controls;
 
 /// <summary>
-/// High-performance ink drawing surface using Direct2D.
+/// Infinite world-space canvas backed entirely by Windows App SDK 2.5.4 native ink.
+/// The OS owns both wet and dry ink; only the paper pattern is drawn by the app.
 /// </summary>
-/// <remarks>
-/// This control provides a complete ink drawing experience with:
-/// <list type="bullet">
-///   <item>Pen/touch drawing with pressure sensitivity</item>
-///   <item>Stroke erasing</item>
-///   <item>Pan and zoom navigation</item>
-///   <item>Configurable background patterns</item>
-/// </list>
-/// </remarks>
 public sealed partial class InkCanvas : UserControl, IDisposable
 {
-    private SwapChainPanel? _swapChainPanel;
-    private SwapChainManager? _swapChainManager;
-    private D2DInkRenderer? _renderer;
-    private InkInputHandler? _inputHandler;
-    private StrokeCollection? _strokes;
+    private sealed record PresentedStroke(Stroke Model, NativeInkStroke Native, Matrix3x2 SourceToWorld);
+
+    private readonly Dictionary<uint, PresentedStroke> _presented = [];
+    private readonly HashSet<uint> _ignoredStrokes = [];
+    private readonly HashSet<uint> _inkingPointers = [];
+    private readonly Dictionary<uint, Vector2> _touches = [];
+    private readonly NativePenHaptics _haptics;
+    private readonly NativeInkPresenter _presenter;
+    private StrokeCollection _strokes = new();
     private ViewportState _viewport = ViewportState.Default;
-    private bool _isInitialized;
-    private bool _isDisposed;
-    private bool _needsRedraw;
-    private bool _isRendering;
-    private Grid? _rootGrid;
-    private bool _isUpdatingViewport;
+    private ViewportState _renderedViewport = ViewportState.Default;
+    private ViewportState _captureViewport = ViewportState.Default;
+    private uint? _panPointer;
+    private Vector2 _panPosition;
+    private bool _awaitingCollectedStroke;
+    private bool _discardCurrentStroke;
+    private bool _frameQueued;
+    private bool _updatingProperties;
+    private bool _updatingToolbar;
+    private bool _initialized;
+    private bool _disposed;
 
-    private readonly ILogger<InkCanvas>? _logger;
-
-    #region Dependency Properties
-
-    /// <summary>
-    /// Identifies the <see cref="PenColor"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty PenColorProperty =
-        DependencyProperty.Register(nameof(PenColor), typeof(Windows.UI.Color), typeof(InkCanvas),
+        DependencyProperty.Register(nameof(PenColor), typeof(Color), typeof(InkCanvas),
             new PropertyMetadata(Microsoft.UI.Colors.Black, OnPenPropertyChanged));
 
-    /// <summary>
-    /// Gets or sets the pen color for drawing.
-    /// </summary>
-    public Windows.UI.Color PenColor
+    public Color PenColor
     {
-        get => (Windows.UI.Color)GetValue(PenColorProperty);
+        get => (Color)GetValue(PenColorProperty);
         set => SetValue(PenColorProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="PenThickness"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty PenThicknessProperty =
         DependencyProperty.Register(nameof(PenThickness), typeof(double), typeof(InkCanvas),
             new PropertyMetadata(2.0, OnPenPropertyChanged));
 
-    /// <summary>
-    /// Gets or sets the pen stroke thickness in pixels.
-    /// </summary>
+    /// <summary>Pen width in world-space DIPs, before zoom.</summary>
     public double PenThickness
     {
         get => (double)GetValue(PenThicknessProperty);
         set => SetValue(PenThicknessProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="ToolMode"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty ToolModeProperty =
         DependencyProperty.Register(nameof(ToolMode), typeof(ToolMode), typeof(InkCanvas),
             new PropertyMetadata(ToolMode.Pen, OnToolModeChanged));
 
-    /// <summary>
-    /// Gets or sets the current tool mode (Pen, Eraser, or Pan).
-    /// </summary>
     public ToolMode ToolMode
     {
         get => (ToolMode)GetValue(ToolModeProperty);
         set => SetValue(ToolModeProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="EraserRadius"/> dependency property.
-    /// </summary>
-    public static readonly DependencyProperty EraserRadiusProperty =
-        DependencyProperty.Register(nameof(EraserRadius), typeof(double), typeof(InkCanvas),
-            new PropertyMetadata(10.0));
+    public static readonly DependencyProperty IsMouseInkingEnabledProperty =
+        DependencyProperty.Register(nameof(IsMouseInkingEnabled), typeof(bool), typeof(InkCanvas),
+            new PropertyMetadata(false, OnInputDevicesChanged));
 
-    /// <summary>
-    /// Gets or sets the eraser hit-test radius in pixels.
-    /// </summary>
-    public double EraserRadius
+    /// <summary>Enables left-mouse drawing. Touch always navigates rather than inks.</summary>
+    public bool IsMouseInkingEnabled
     {
-        get => (double)GetValue(EraserRadiusProperty);
-        set => SetValue(EraserRadiusProperty, value);
+        get => (bool)GetValue(IsMouseInkingEnabledProperty);
+        set => SetValue(IsMouseInkingEnabledProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="BgType"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty BgTypeProperty =
         DependencyProperty.Register(nameof(BgType), typeof(BackgroundType), typeof(InkCanvas),
             new PropertyMetadata(BackgroundType.Blank, OnBackgroundChanged));
 
-    /// <summary>
-    /// Gets or sets the background pattern type.
-    /// </summary>
     public BackgroundType BgType
     {
         get => (BackgroundType)GetValue(BgTypeProperty);
         set => SetValue(BgTypeProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="BgSpacing"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty BgSpacingProperty =
         DependencyProperty.Register(nameof(BgSpacing), typeof(double), typeof(InkCanvas),
             new PropertyMetadata(24.0, OnBackgroundChanged));
 
-    /// <summary>
-    /// Gets or sets the background pattern spacing in pixels.
-    /// </summary>
     public double BgSpacing
     {
         get => (double)GetValue(BgSpacingProperty);
         set => SetValue(BgSpacingProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="BgColorArgb"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty BgColorArgbProperty =
         DependencyProperty.Register(nameof(BgColorArgb), typeof(int), typeof(InkCanvas),
-            new PropertyMetadata(D2DBackgroundSettings.DefaultPatternColorArgb, OnBackgroundChanged));
+            new PropertyMetadata(unchecked((int)0x20000000), OnBackgroundChanged));
 
-    /// <summary>
-    /// Gets or sets the background pattern color as packed ARGB integer.
-    /// </summary>
     public int BgColorArgb
     {
         get => (int)GetValue(BgColorArgbProperty);
         set => SetValue(BgColorArgbProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="PanX"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty PanXProperty =
         DependencyProperty.Register(nameof(PanX), typeof(double), typeof(InkCanvas),
             new PropertyMetadata(0.0, OnViewportChanged));
 
-    /// <summary>
-    /// Gets or sets the horizontal pan offset.
-    /// </summary>
     public double PanX
     {
         get => (double)GetValue(PanXProperty);
         set => SetValue(PanXProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="PanY"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty PanYProperty =
         DependencyProperty.Register(nameof(PanY), typeof(double), typeof(InkCanvas),
             new PropertyMetadata(0.0, OnViewportChanged));
 
-    /// <summary>
-    /// Gets or sets the vertical pan offset.
-    /// </summary>
     public double PanY
     {
         get => (double)GetValue(PanYProperty);
         set => SetValue(PanYProperty, value);
     }
 
-    /// <summary>
-    /// Identifies the <see cref="Zoom"/> dependency property.
-    /// </summary>
     public static readonly DependencyProperty ZoomProperty =
         DependencyProperty.Register(nameof(Zoom), typeof(double), typeof(InkCanvas),
             new PropertyMetadata(1.0, OnViewportChanged));
 
-    /// <summary>
-    /// Gets or sets the zoom level (1.0 = 100%).
-    /// </summary>
     public double Zoom
     {
         get => (double)GetValue(ZoomProperty);
         set => SetValue(ZoomProperty, value);
     }
 
-    #endregion
-
-    #region Events
-
-    /// <summary>
-    /// Occurs when strokes are added or removed.
-    /// </summary>
     public event EventHandler? StrokesChanged;
-
-    /// <summary>
-    /// Occurs when a stroke is completed.
-    /// </summary>
     public event EventHandler<StrokeCompletedEventArgs>? StrokeCompleted;
-
-    /// <summary>
-    /// Occurs when the viewport (pan/zoom) changes.
-    /// </summary>
     public event EventHandler<ViewportChangedEventArgs>? ViewportChanged;
 
-    #endregion
+    public InkCanvas() : this(null) { }
 
-    /// <summary>
-    /// Initializes a new instance of the <see cref="InkCanvas"/> class.
-    /// </summary>
-    public InkCanvas() : this(null)
-    {
-    }
-
-    /// <summary>
-    /// Initializes a new instance of the <see cref="InkCanvas"/> class with optional logging.
-    /// </summary>
-    /// <param name="loggerFactory">Optional logger factory for diagnostic logging.</param>
     public InkCanvas(ILoggerFactory? loggerFactory)
     {
-        _logger = loggerFactory?.CreateLogger<InkCanvas>();
-
+        _haptics = new NativePenHaptics(loggerFactory?.CreateLogger<InkCanvas>());
         InitializeComponent();
+        _presenter = NativeCanvas.InkPresenter;
+        PenButton.Palette = new List<Brush>
+        {
+            new SolidColorBrush(Microsoft.UI.Colors.Black),
+            new SolidColorBrush(Microsoft.UI.Colors.Blue),
+            new SolidColorBrush(Microsoft.UI.Colors.Red),
+            new SolidColorBrush(Microsoft.UI.Colors.Green),
+            new SolidColorBrush(Microsoft.UI.Colors.Purple),
+            new SolidColorBrush(Microsoft.UI.Colors.Orange)
+        };
+        _presenter.InputProcessingConfiguration.RightDragAction = InkInputRightDragAction.LeaveUnprocessed;
+        _presenter.InputConfiguration.IsEraserInputEnabled = true;
+        _presenter.InputConfiguration.IsPrimaryBarrelButtonInputEnabled = true;
+        _presenter.HighContrastAdjustment = InkHighContrastAdjustment.UseSystemColorsWhenNecessary;
+        _presenter.StrokesCollected += OnStrokesCollected;
+        _presenter.StrokesErased += OnStrokesErased;
+        _presenter.StrokeInput.StrokeStarted += OnStrokeStarted;
+        _presenter.StrokeInput.StrokeEnded += OnStrokeEnded;
+        _presenter.StrokeInput.StrokeCanceled += OnStrokeCanceled;
+        _presenter.UnprocessedInput.PointerPressed += OnUnprocessedPressed;
+        _presenter.UnprocessedInput.PointerMoved += OnUnprocessedMoved;
+        _presenter.UnprocessedInput.PointerReleased += OnUnprocessedReleased;
+        _presenter.UnprocessedInput.PointerLost += OnUnprocessedReleased;
 
-        _rootGrid = RootGrid;
-        _strokes = new StrokeCollection();
+        Toolbar.ActiveToolChanged += OnToolbarToolChanged;
+        Toolbar.InkDrawingAttributesChanged += OnToolbarAttributesChanged;
+        Toolbar.EraseAllClicked += OnToolbarEraseAll;
         _strokes.StrokesChanged += OnStrokesCollectionChanged;
-
+        ViewportGrid.SizeChanged += OnViewportSizeChanged;
+        ViewportGrid.AddHandler(PointerWheelChangedEvent, new PointerEventHandler(OnPointerWheelChanged), true);
+        ViewportGrid.AddHandler(PointerPressedEvent, new PointerEventHandler(OnTouchPressed), true);
+        ViewportGrid.AddHandler(PointerMovedEvent, new PointerEventHandler(OnTouchMoved), true);
+        ViewportGrid.AddHandler(PointerReleasedEvent, new PointerEventHandler(OnTouchReleased), true);
+        ViewportGrid.AddHandler(PointerCanceledEvent, new PointerEventHandler(OnTouchReleased), true);
+        ViewportGrid.AddHandler(PointerCaptureLostEvent, new PointerEventHandler(OnTouchReleased), true);
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
-        SizeChanged += OnSizeChanged;
+        _initialized = true;
+        UpdateInputDevices();
+        UpdateToolbar();
+        UpdateDrawingAttributes();
     }
+
+    private bool IsCollecting => _inkingPointers.Count != 0 || _awaitingCollectedStroke;
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        _logger?.LogDebug("InkCanvas loaded");
-        InitializeRendering();
+        _presenter.IsInputEnabled = !_disposed;
+        RequestViewUpdate();
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
-        Dispose();
+        CancelQueuedFrame();
+        _discardCurrentStroke = IsCollecting;
+        _inkingPointers.Clear();
+        _awaitingCollectedStroke = false;
+        _touches.Clear();
+        _panPointer = null;
+        _haptics.Stop();
+        // Unloading is not disposal: the native control supports reparenting/reloading.
+        _presenter.IsInputEnabled = false;
     }
 
-    private void OnSizeChanged(object sender, SizeChangedEventArgs e)
+    private void OnViewportSizeChanged(object sender, SizeChangedEventArgs e)
     {
-        if (!_isInitialized || _swapChainManager is null) return;
-
-        var width = (uint)Math.Max(1, ActualWidth);
-        var height = (uint)Math.Max(1, ActualHeight);
-
-        try
-        {
-            _swapChainManager.Resize(width, height);
-            RequestRedraw();
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Failed to resize swap chain");
-        }
+        ViewportClip.Rect = new Rect(0, 0, Math.Max(0, e.NewSize.Width), Math.Max(0, e.NewSize.Height));
+        RequestViewUpdate();
     }
 
-    #region Initialization
-
-    private void InitializeRendering()
+    private void RequestViewUpdate()
     {
-        if (_isInitialized || _rootGrid is null) return;
+        if (!_initialized || _disposed || !IsLoaded || _frameQueued || IsCollecting)
+            return;
 
-        try
-        {
-            var deviceManager = DeviceManager.Instance;
-            deviceManager.DeviceLost += OnDeviceLost;
-            deviceManager.DeviceRestored += OnDeviceRestored;
+        _frameQueued = true;
+        CompositionTarget.Rendering += OnRendering;
+    }
 
-            // Create swap chain
-            var width = (uint)Math.Max(1, ActualWidth);
-            var height = (uint)Math.Max(1, ActualHeight);
-            _swapChainManager = new SwapChainManager(deviceManager, width, height);
+    private void CancelQueuedFrame()
+    {
+        if (!_frameQueued) return;
+        CompositionTarget.Rendering -= OnRendering;
+        _frameQueued = false;
+    }
 
-            // Create swap chain panel and set the swap chain
-            _swapChainPanel = new SwapChainPanel();
-            SetSwapChainOnPanel(_swapChainPanel, _swapChainManager.SwapChain);
-            _rootGrid.Children.Add(_swapChainPanel);
+    private void OnRendering(object? sender, object e)
+    {
+        CancelQueuedFrame();
+        if (_disposed || IsCollecting || !IsLoaded) return;
 
-            // Create renderer
-            _renderer = new D2DInkRenderer(_swapChainManager, deviceManager);
+        SynchronizeNativeStrokes();
+        foreach (var entry in _presented.Values)
+            NativeStrokeAdapter.Project(entry.Native, entry.SourceToWorld, entry.Model, _viewport);
 
-            // Create input handler
-            _inputHandler = new InkInputHandler
+        var viewportChanged = _renderedViewport != _viewport;
+        _renderedViewport = _viewport;
+        UpdateDrawingAttributes();
+        DrawBackground();
+        if (viewportChanged)
+            ViewportChanged?.Invoke(this, new ViewportChangedEventArgs
             {
-                Viewport = _viewport,
-                PenColor = PenColor,
-                PenThickness = (float)PenThickness,
-                Mode = ToolMode,
-                EraserTolerance = (float)EraserRadius
-            };
-
-            // Wire up pointer events for pen input and mouse wheel
-            _swapChainPanel.PointerPressed += _inputHandler.OnPointerPressed;
-            _swapChainPanel.PointerMoved += _inputHandler.OnPointerMoved;
-            _swapChainPanel.PointerReleased += _inputHandler.OnPointerReleased;
-            _swapChainPanel.PointerCanceled += _inputHandler.OnPointerCanceled;
-            _swapChainPanel.PointerWheelChanged += _inputHandler.OnPointerWheelChanged;
-            _swapChainPanel.PointerEntered += _inputHandler.OnPointerEntered;
-            _swapChainPanel.PointerExited += _inputHandler.OnPointerExited;
-
-            // Enable XAML manipulation events for touch and touchpad pan/zoom with inertia
-            _swapChainPanel.ManipulationMode =
-                ManipulationModes.TranslateX |
-                ManipulationModes.TranslateY |
-                ManipulationModes.Scale |
-                ManipulationModes.TranslateInertia |
-                ManipulationModes.ScaleInertia;
-
-            _swapChainPanel.ManipulationStarted += _inputHandler.OnManipulationStarted;
-            _swapChainPanel.ManipulationDelta += _inputHandler.OnManipulationDelta;
-            _swapChainPanel.ManipulationInertiaStarting += _inputHandler.OnManipulationInertiaStarting;
-            _swapChainPanel.ManipulationCompleted += _inputHandler.OnManipulationCompleted;
-
-            _inputHandler.StrokeCompleted += OnStrokeCompletedHandler;
-            _inputHandler.PanDelta += OnPanDelta;
-            _inputHandler.ZoomDelta += OnZoomDelta;
-            _inputHandler.RedrawRequested += OnRedrawRequested;
-            _inputHandler.StrokeEraseRequested += OnStrokeEraseRequested;
-
-            _isInitialized = true;
-
-            // Initial render
-            RequestRedraw();
-
-            _logger?.LogDebug("D2D rendering initialized");
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Failed to initialize D2D rendering");
-            throw;
-        }
+                PanX = _viewport.Pan.X, PanY = _viewport.Pan.Y, Zoom = _viewport.Zoom
+            });
     }
 
-    private static void SetSwapChainOnPanel(SwapChainPanel panel, nint swapChain)
+    private void SynchronizeNativeStrokes()
     {
-        // Get the ISwapChainPanelNative interface using WinRT interop
-        var panelNative = panel.As<ISwapChainPanelNative>();
-        panelNative.SetSwapChain(swapChain);
+        var models = _strokes.Strokes.ToDictionary(s => s.Id);
+        var removed = _presented.Values
+            .Where(p => !models.TryGetValue(p.Model.Id, out var model) || !ReferenceEquals(model, p.Model))
+            .ToArray();
+        foreach (var entry in removed)
+        {
+            _presented.Remove(entry.Native.Id);
+            entry.Native.Selected = true;
+        }
+        if (removed.Length != 0)
+            _presenter.StrokeContainer.DeleteSelected();
+
+        var existing = _presented.Values.Select(p => p.Model.Id).ToHashSet();
+        var added = new List<NativeInkStroke>();
+        foreach (var model in models.Values)
+        {
+            if (existing.Contains(model.Id) || model.Points.Count == 0) continue;
+            var native = NativeStrokeAdapter.CreateNative(model);
+            NativeStrokeAdapter.Project(native, Matrix3x2.Identity, model, _viewport);
+            _presented.Add(native.Id, new PresentedStroke(model, native, Matrix3x2.Identity));
+            added.Add(native);
+        }
+        if (added.Count != 0)
+            _presenter.StrokeContainer.AddStrokes(added);
     }
 
-    [ComImport]
-    [Guid("63aad0b8-7c24-40ff-85a8-640d944cc325")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    private interface ISwapChainPanelNative
+    private void OnStrokeStarted(Microsoft.UI.Xaml.Controls.InkStrokeInput sender, PointerEventArgs args)
     {
-        void SetSwapChain(nint swapChain);
+        if (_disposed) return;
+        if (!IsCollecting)
+        {
+            _captureViewport = _renderedViewport;
+            _discardCurrentStroke = false;
+        }
+        _inkingPointers.Add(args.CurrentPoint.PointerId);
+        _awaitingCollectedStroke = true;
+        _haptics.Start(args.CurrentPoint);
     }
 
-    #endregion
-
-    #region Rendering
-
-    private void RequestRedraw()
+    private void OnStrokeEnded(Microsoft.UI.Xaml.Controls.InkStrokeInput sender, PointerEventArgs args)
     {
-        if (!_isInitialized) return;
-
-        _needsRedraw = true;
-
-        // During active drawing, render immediately for lowest latency.
-        // Otherwise, queue to dispatcher for next frame.
-        if (_inputHandler?.IsDrawing == true)
-        {
-            RenderImmediate();
-        }
-        else
-        {
-            DispatcherQueue.TryEnqueue(Render);
-        }
+        _inkingPointers.Remove(args.CurrentPoint.PointerId);
+        _haptics.Stop();
+        // Keep the viewport fixed until StrokesCollected delivers the completed native stroke.
+        RequestViewUpdate();
     }
 
-    /// <summary>
-    /// Renders immediately without going through the dispatcher queue.
-    /// Used during active drawing for lowest latency.
-    /// </summary>
-    private void RenderImmediate()
+    private void OnStrokeCanceled(Microsoft.UI.Xaml.Controls.InkStrokeInput sender, PointerEventArgs args)
     {
-        if (!_isInitialized || _isRendering) return;
-        if (_renderer is null || _swapChainManager is null || _strokes is null) return;
-
-        _isRendering = true;
-        _needsRedraw = false;
-
-        try
-        {
-            var bgSettings = new D2DBackgroundSettings(
-                BgType,
-                (float)BgSpacing,
-                GetPatternColor(),
-                new Color4(1f, 1f, 1f, 1f));
-
-            _renderer.Render(_strokes, _inputHandler?.CurrentStroke, _viewport, bgSettings, isActivelyDrawing: true);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Immediate render failed");
-        }
-        finally
-        {
-            _isRendering = false;
-        }
+        _inkingPointers.Remove(args.CurrentPoint.PointerId);
+        _awaitingCollectedStroke = false;
+        _discardCurrentStroke = false;
+        _haptics.Stop();
+        RequestViewUpdate();
     }
 
-    private void Render()
+    private void OnStrokesCollected(NativeInkPresenter sender, InkStrokesCollectedEventArgs args)
     {
-        if (!_isInitialized || !_needsRedraw || _isRendering) return;
-        if (_renderer is null || _swapChainManager is null || _strokes is null) return;
-
-        _isRendering = true;
-        _needsRedraw = false;
-
-        try
+        if (_disposed) return;
+        foreach (var native in args.Strokes)
         {
-            // Create background settings from dependency properties
-            var bgSettings = new D2DBackgroundSettings(
-                BgType,
-                (float)BgSpacing,
-                GetPatternColor(),
-                new Color4(1f, 1f, 1f, 1f)); // White background
-
-            // Check if actively drawing - disable vsync for lower latency during inking
-            bool isActivelyDrawing = _inputHandler?.IsDrawing == true;
-
-            // Render with background
-            _renderer.Render(_strokes, _inputHandler?.CurrentStroke, _viewport, bgSettings, isActivelyDrawing);
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError(ex, "Render failed");
-        }
-        finally
-        {
-            _isRendering = false;
-        }
-    }
-
-    /// <summary>
-    /// Converts the <see cref="BgColorArgb"/> dependency property value to a <see cref="Color4"/> structure
-    /// for use with Direct2D rendering.
-    /// </summary>
-    private Color4 GetPatternColor()
-    {
-        var argb = BgColorArgb;
-        float a = ((argb >> 24) & 0xFF) / 255f;
-        float r = ((argb >> 16) & 0xFF) / 255f;
-        float g = ((argb >> 8) & 0xFF) / 255f;
-        float b = (argb & 0xFF) / 255f;
-        return new Color4(r, g, b, a);
-    }
-
-    #endregion
-
-    #region Input Handling
-
-    private void OnStrokeCompletedHandler(object? sender, Stroke stroke)
-    {
-        _strokes?.Add(stroke);
-        StrokeCompleted?.Invoke(this, new StrokeCompletedEventArgs { Stroke = stroke });
-        RequestRedraw();
-    }
-
-    private void OnStrokeEraseRequested(object? sender, (Vector2 Position, float Tolerance) args)
-    {
-        if (_strokes is null) return;
-
-        var strokesToRemove = _strokes.GetStrokesAt(args.Position, args.Tolerance).ToList();
-
-        if (strokesToRemove.Count > 0)
-        {
-            foreach (var stroke in strokesToRemove)
+            if (_ignoredStrokes.Remove(native.Id) || _discardCurrentStroke)
             {
-                _strokes.Remove(stroke);
+                native.Selected = true;
+                _presenter.StrokeContainer.DeleteSelected();
+                continue;
             }
-            RequestRedraw();
+            if (_presented.ContainsKey(native.Id)) continue;
+
+            var captureViewport = IsCollecting ? _captureViewport : _renderedViewport;
+            var model = NativeStrokeAdapter.Capture(native, captureViewport, DateTime.UtcNow.Ticks);
+            var sourceToWorld = native.PointTransform * captureViewport.GetInverseTransformMatrix();
+            _presented.Add(native.Id, new PresentedStroke(model, native, sourceToWorld));
+            _strokes.Add(model);
+            StrokeCompleted?.Invoke(this, new StrokeCompletedEventArgs { Stroke = model });
+        }
+        _awaitingCollectedStroke = false;
+        _discardCurrentStroke = false;
+        RequestViewUpdate();
+    }
+
+    private void OnStrokesErased(NativeInkPresenter sender, InkStrokesErasedEventArgs args)
+    {
+        if (_disposed) return;
+        foreach (var native in args.Strokes)
+        {
+            if (_presented.Remove(native.Id, out var entry))
+                _strokes.Remove(entry.Model);
         }
     }
 
-    private void OnPanDelta(object? sender, Vector2 delta)
+    private void OnStrokesCollectionChanged(object? sender, EventArgs e)
     {
-        if (delta == Vector2.Zero) return;
+        RequestViewUpdate();
+        StrokesChanged?.Invoke(this, EventArgs.Empty);
+    }
 
-        _logger?.LogTrace("PanDelta: Delta=({DeltaX:F2}, {DeltaY:F2}), Before=({BeforeX:F2}, {BeforeY:F2})",
-            delta.X, delta.Y, _viewport.Pan.X, _viewport.Pan.Y);
-
-        _viewport = _viewport.AddPan(delta);
-
-        _logger?.LogTrace("PanDelta: After=({AfterX:F2}, {AfterY:F2})", _viewport.Pan.X, _viewport.Pan.Y);
-
-        // Prevent re-entrancy from two-way binding callbacks
-        _isUpdatingViewport = true;
-        try
+    private void UpdateDrawingAttributes()
+    {
+        if (!_initialized || _disposed) return;
+        _presenter.UpdateDefaultDrawingAttributes(new InkDrawingAttributes
         {
-            PanX = _viewport.Pan.X;
-            PanY = _viewport.Pan.Y;
-        }
-        finally
-        {
-            _isUpdatingViewport = false;
-        }
-
-        if (_inputHandler is not null)
-        {
-            _inputHandler.Viewport = _viewport;
-        }
-
-        _renderer?.InvalidateStaticContent();
-
-        RequestRedraw();
-        ViewportChanged?.Invoke(this, new ViewportChangedEventArgs
-        {
-            PanX = (float)PanX,
-            PanY = (float)PanY,
-            Zoom = (float)Zoom
+            Color = PenColor,
+            Size = new Size(PenThickness * _renderedViewport.Zoom, PenThickness * _renderedViewport.Zoom),
+            IgnorePressure = false,
+            IgnoreTilt = false
         });
     }
 
-    private void OnZoomDelta(object? sender, (float Scale, Vector2 Center) args)
+    private void UpdateInputDevices()
     {
-        float newZoom = _viewport.Zoom * args.Scale;
-        newZoom = Math.Clamp(newZoom, ViewportState.MinZoom, ViewportState.MaxZoom);
+        _presenter.InputDeviceTypes = CoreInputDeviceTypes.Pen |
+            (IsMouseInkingEnabled || ToolMode == ToolMode.Pan ? CoreInputDeviceTypes.Mouse : CoreInputDeviceTypes.None);
+    }
 
-        if (Math.Abs(newZoom - _viewport.Zoom) < 0.001f)
+    private void UpdateToolbar()
+    {
+        if (!_initialized || _disposed || _updatingToolbar) return;
+        _updatingToolbar = true;
+        try
+        {
+            Toolbar.ActiveTool = ToolMode switch
+            {
+                ToolMode.Eraser => EraserButton,
+                ToolMode.Pan => PanButton,
+                _ => PenButton
+            };
+            PenButton.SelectedStrokeWidth = PenThickness;
+            var index = PenButton.Palette
+                .Select((brush, i) => (brush, i))
+                .FirstOrDefault(p => p.brush is SolidColorBrush solid && solid.Color == PenColor, (null, -1)).i;
+            if (index < 0)
+            {
+                PenButton.Palette.Add(new SolidColorBrush(PenColor));
+                index = PenButton.Palette.Count - 1;
+            }
+            PenButton.SelectedBrushIndex = index;
+            _presenter.InputProcessingConfiguration.Mode = ToolMode switch
+            {
+                ToolMode.Eraser => NativeProcessingMode.Erasing,
+                ToolMode.Pan => NativeProcessingMode.None,
+                _ => NativeProcessingMode.Inking
+            };
+            UpdateInputDevices();
+            UpdateDrawingAttributes();
+        }
+        finally
+        {
+            _updatingToolbar = false;
+        }
+    }
+
+    private void OnToolbarToolChanged(InkToolbar sender, object args)
+    {
+        if (_updatingToolbar || !_initialized) return;
+        ToolMode = sender.ActiveTool == PanButton ? ToolMode.Pan :
+            sender.ActiveTool == EraserButton ? ToolMode.Eraser : ToolMode.Pen;
+    }
+
+    private void OnToolbarAttributesChanged(InkToolbar sender, object args)
+    {
+        if (_updatingToolbar || !_initialized) return;
+        _updatingToolbar = true;
+        try
+        {
+            PenColor = sender.InkDrawingAttributes.Color;
+            PenThickness = sender.InkDrawingAttributes.Size.Width;
+        }
+        finally
+        {
+            _updatingToolbar = false;
+        }
+        UpdateDrawingAttributes();
+    }
+
+    private void OnToolbarEraseAll(InkToolbar sender, object args) => Clear();
+
+    private void ZoomIn_Click(object sender, RoutedEventArgs args) => SetZoom(_viewport.Zoom * ViewportState.ZoomInFactor);
+    private void ZoomOut_Click(object sender, RoutedEventArgs args) => SetZoom(_viewport.Zoom * ViewportState.ZoomOutFactor);
+
+    private void OnUnprocessedPressed(Microsoft.UI.Xaml.Controls.InkUnprocessedInput sender, PointerEventArgs args)
+    {
+        if (_disposed || IsCollecting) return;
+        var point = args.CurrentPoint;
+        if (ToolMode != ToolMode.Pan && !point.Properties.IsRightButtonPressed &&
+            !point.Properties.IsMiddleButtonPressed && !point.Properties.IsBarrelButtonPressed)
             return;
+        _panPointer = point.PointerId;
+        _panPosition = new Vector2((float)point.Position.X, (float)point.Position.Y);
+    }
 
-        _logger?.LogTrace("ZoomDelta: Scale={Scale:F3}, Center=({CenterX:F1}, {CenterY:F1}), NewZoom={NewZoom:F3}",
-            args.Scale, args.Center.X, args.Center.Y, newZoom);
+    private void OnUnprocessedMoved(Microsoft.UI.Xaml.Controls.InkUnprocessedInput sender, PointerEventArgs args)
+    {
+        if (_panPointer != args.CurrentPoint.PointerId) return;
+        var point = args.CurrentPoint.Position;
+        var position = new Vector2((float)point.X, (float)point.Y);
+        SetViewport(_viewport.AddPan(position - _panPosition));
+        _panPosition = position;
+    }
 
-        _viewport = _viewport.ZoomAroundPoint(newZoom, args.Center);
+    private void OnUnprocessedReleased(Microsoft.UI.Xaml.Controls.InkUnprocessedInput sender, PointerEventArgs args)
+    {
+        if (_panPointer == args.CurrentPoint.PointerId)
+            _panPointer = null;
+    }
 
-        _isUpdatingViewport = true;
+    private void OnPointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        e.Handled = true;
+        if (IsCollecting) return;
+        var point = e.GetCurrentPoint(ViewportGrid);
+        var delta = point.Properties.MouseWheelDelta;
+        if (e.KeyModifiers.HasFlag(Windows.System.VirtualKeyModifiers.Control))
+        {
+            var center = new Vector2((float)point.Position.X, (float)point.Position.Y);
+            ZoomAt(_viewport.Zoom * MathF.Pow(1.1f, delta / 120f), center);
+        }
+        else
+        {
+            var horizontal = point.Properties.IsHorizontalMouseWheel ||
+                e.KeyModifiers.HasFlag(Windows.System.VirtualKeyModifiers.Shift);
+            PanBy(horizontal ? delta / 2f : 0, horizontal ? 0 : delta / 2f);
+        }
+    }
+
+    private void OnTouchPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (e.Pointer.PointerDeviceType != PointerDeviceType.Touch || IsCollecting) return;
+        var point = e.GetCurrentPoint(ViewportGrid).Position;
+        if (!ViewportGrid.CapturePointer(e.Pointer)) return;
+        _touches[e.Pointer.PointerId] = new Vector2((float)point.X, (float)point.Y);
+        _presenter.IsInputEnabled = false;
+        e.Handled = true;
+    }
+
+    private void OnTouchMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_touches.ContainsKey(e.Pointer.PointerId)) return;
+        var oldPoints = _touches.Values.ToArray();
+        var point = e.GetCurrentPoint(ViewportGrid).Position;
+        _touches[e.Pointer.PointerId] = new Vector2((float)point.X, (float)point.Y);
+        var newPoints = _touches.Values.ToArray();
+        var oldCenter = oldPoints.Aggregate(Vector2.Zero, (sum, p) => sum + p) / oldPoints.Length;
+        var newCenter = newPoints.Aggregate(Vector2.Zero, (sum, p) => sum + p) / newPoints.Length;
+        var view = _viewport;
+        if (oldPoints.Length >= 2)
+        {
+            var oldDistance = Vector2.Distance(oldPoints[0], oldPoints[1]);
+            var newDistance = Vector2.Distance(newPoints[0], newPoints[1]);
+            if (oldDistance > 5 && newDistance > 5)
+                view = view.ZoomAroundPoint(view.Zoom * newDistance / oldDistance, oldCenter);
+        }
+        SetViewport(view.AddPan(newCenter - oldCenter));
+        e.Handled = true;
+    }
+
+    private void OnTouchReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_touches.Remove(e.Pointer.PointerId)) return;
+        ViewportGrid.ReleasePointerCapture(e.Pointer);
+        if (_touches.Count == 0)
+            _presenter.IsInputEnabled = !_disposed;
+        e.Handled = true;
+    }
+
+    private void SetViewport(ViewportState viewport)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!float.IsFinite(viewport.Pan.X) || !float.IsFinite(viewport.Pan.Y) || !float.IsFinite(viewport.Zoom))
+            throw new ArgumentOutOfRangeException(nameof(viewport), "Viewport coordinates must be finite.");
+        _viewport = viewport.WithZoom(viewport.Zoom);
+        _updatingProperties = true;
         try
         {
             PanX = _viewport.Pan.X;
@@ -566,335 +546,188 @@ public sealed partial class InkCanvas : UserControl, IDisposable
         }
         finally
         {
-            _isUpdatingViewport = false;
+            _updatingProperties = false;
         }
-
-        if (_inputHandler is not null)
-        {
-            _inputHandler.Viewport = _viewport;
-        }
-
-        _renderer?.InvalidateStaticContent();
-
-        RequestRedraw();
-        ViewportChanged?.Invoke(this, new ViewportChangedEventArgs
-        {
-            PanX = (float)PanX,
-            PanY = (float)PanY,
-            Zoom = (float)Zoom
-        });
+        RequestViewUpdate();
     }
 
-    private void OnRedrawRequested(object? sender, EventArgs e)
+    private void DrawBackground()
     {
-        RequestRedraw();
+        var geometry = new GeometryGroup();
+        var color = Color.FromArgb((byte)(BgColorArgb >> 24), (byte)(BgColorArgb >> 16),
+            (byte)(BgColorArgb >> 8), (byte)BgColorArgb);
+        var brush = new SolidColorBrush(color);
+        BackgroundPattern.Stroke = BgType == BackgroundType.Ruled ? brush : null;
+        BackgroundPattern.Fill = BgType == BackgroundType.Dotted ? brush : null;
+        BackgroundPattern.StrokeThickness = 1;
+
+        if (BgType != BackgroundType.Blank)
+        {
+            var step = BgSpacing * _renderedViewport.Zoom;
+            // Thin the world-anchored lattice at low zoom instead of creating an unbounded
+            // number of XAML geometries. Dot size and ruled-line weight stay screen-constant.
+            while (step < 12) step *= 2;
+            var startX = ((_renderedViewport.Pan.X % step) + step) % step;
+            var startY = ((_renderedViewport.Pan.Y % step) + step) % step;
+            for (var y = startY; y < ViewportGrid.ActualHeight; y += step)
+            {
+                if (BgType == BackgroundType.Ruled)
+                    geometry.Children.Add(new LineGeometry
+                    {
+                        StartPoint = new Point(0, y), EndPoint = new Point(ViewportGrid.ActualWidth, y)
+                    });
+                else
+                    for (var x = startX; x < ViewportGrid.ActualWidth; x += step)
+                        geometry.Children.Add(new EllipseGeometry
+                        {
+                            Center = new Point(x, y), RadiusX = 1.25, RadiusY = 1.25
+                        });
+            }
+        }
+        BackgroundPattern.Data = geometry;
     }
-
-    #endregion
-
-    #region Property Change Handlers
 
     private static void OnPenPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
-        var control = (InkCanvas)d;
-        if (control._inputHandler is not null)
-        {
-            control._inputHandler.PenColor = control.PenColor;
-            control._inputHandler.PenThickness = (float)control.PenThickness;
-        }
+        var canvas = (InkCanvas)d;
+        if (!double.IsFinite(canvas.PenThickness) || canvas.PenThickness <= 0 || canvas.PenThickness > 100)
+            throw new ArgumentOutOfRangeException(nameof(PenThickness), "Pen width must be in (0, 100] world DIPs.");
+        canvas.UpdateToolbar();
+        canvas.UpdateDrawingAttributes();
     }
 
-    private static void OnToolModeChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    private static void OnToolModeChanged(DependencyObject d, DependencyPropertyChangedEventArgs e) =>
+        ((InkCanvas)d).UpdateToolbar();
+
+    private static void OnInputDevicesChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
-        var control = (InkCanvas)d;
-        if (control._inputHandler is not null)
-        {
-            control._inputHandler.Mode = (ToolMode)e.NewValue;
-        }
+        var canvas = (InkCanvas)d;
+        if (canvas._initialized) canvas.UpdateInputDevices();
     }
 
     private static void OnBackgroundChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
-        var control = (InkCanvas)d;
-        control.RequestRedraw();
+        var canvas = (InkCanvas)d;
+        if (!double.IsFinite(canvas.BgSpacing) || canvas.BgSpacing < 1)
+            throw new ArgumentOutOfRangeException(nameof(BgSpacing), "Background spacing must be at least one world DIP.");
+        canvas.RequestViewUpdate();
     }
 
     private static void OnViewportChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
     {
-        var control = (InkCanvas)d;
-
-        if (control._isUpdatingViewport)
-            return;
-
-        var newPan = new Vector2((float)control.PanX, (float)control.PanY);
-        var newZoom = (float)control.Zoom;
-
-        bool panChanged = Vector2.Distance(newPan, control._viewport.Pan) > 0.01f;
-        bool zoomChanged = Math.Abs(newZoom - control._viewport.Zoom) > 0.001f;
-
-        if (panChanged || zoomChanged)
+        var canvas = (InkCanvas)d;
+        if (canvas._updatingProperties) return;
+        canvas.SetViewport(new ViewportState
         {
-            control._viewport = new ViewportState
-            {
-                Pan = newPan,
-                Zoom = Math.Clamp(newZoom, ViewportState.MinZoom, ViewportState.MaxZoom)
-            };
-
-            if (control._inputHandler is not null)
-            {
-                control._inputHandler.Viewport = control._viewport;
-            }
-
-            // Invalidate static content when viewport changes
-            control._renderer?.InvalidateStaticContent();
-
-            control.RequestRedraw();
-        }
+            Pan = new Vector2((float)canvas.PanX, (float)canvas.PanY), Zoom = (float)canvas.Zoom
+        });
     }
 
-    #endregion
+    public bool HasStrokes => _strokes.Strokes.Count != 0;
+    public StrokeCollection GetStrokes() => _strokes;
 
-    #region Device Lost Handling
-
-    private void OnDeviceLost(object? sender, EventArgs e)
+    public void SetStrokes(StrokeCollection strokes)
     {
-        _logger?.LogWarning("D3D device lost, will recreate");
-        _renderer?.ClearBrushCache();
-    }
-
-    private void OnDeviceRestored(object? sender, EventArgs e)
-    {
-        _logger?.LogInformation("D3D device restored");
-
-        if (_swapChainManager is not null)
-        {
-            _swapChainManager.Dispose();
-
-            var width = (uint)Math.Max(1, ActualWidth);
-            var height = (uint)Math.Max(1, ActualHeight);
-            _swapChainManager = new SwapChainManager(DeviceManager.Instance, width, height);
-
-            if (_swapChainPanel is not null)
-            {
-                SetSwapChainOnPanel(_swapChainPanel, _swapChainManager.SwapChain);
-            }
-
-            _renderer = new D2DInkRenderer(_swapChainManager, DeviceManager.Instance);
-        }
-
-        RequestRedraw();
-    }
-
-    #endregion
-
-    #region Stroke Collection Changed
-
-    private void OnStrokesCollectionChanged(object? sender, EventArgs e)
-    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(strokes);
+        DiscardPendingInk();
+        _strokes.StrokesChanged -= OnStrokesCollectionChanged;
+        _strokes = strokes;
+        _strokes.StrokesChanged += OnStrokesCollectionChanged;
+        RequestViewUpdate();
         StrokesChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    #endregion
-
-    #region Public Methods
-
-    /// <summary>
-    /// Gets whether the canvas has any strokes.
-    /// </summary>
-    public bool HasStrokes => _strokes is not null && _strokes.Strokes.Count > 0;
-
-    /// <summary>
-    /// Gets the current stroke collection.
-    /// </summary>
-    /// <returns>The stroke collection.</returns>
-    public StrokeCollection GetStrokes() => _strokes ?? new StrokeCollection();
-
-    /// <summary>
-    /// Sets the stroke collection.
-    /// </summary>
-    /// <param name="strokes">The strokes to set.</param>
-    public void SetStrokes(StrokeCollection strokes)
+    private void DiscardPendingInk()
     {
-        ArgumentNullException.ThrowIfNull(strokes);
-
-        if (_strokes is not null)
-        {
-            _strokes.StrokesChanged -= OnStrokesCollectionChanged;
-        }
-
-        _strokes = strokes;
-        _strokes.StrokesChanged += OnStrokesCollectionChanged;
-
-        RequestRedraw();
+        foreach (var native in _presenter.StrokeContainer.GetStrokes())
+            if (!_presented.ContainsKey(native.Id)) _ignoredStrokes.Add(native.Id);
+        _discardCurrentStroke = IsCollecting;
     }
 
-    /// <summary>
-    /// Clears all strokes from the canvas.
-    /// </summary>
     public void Clear()
     {
-        _strokes?.Clear();
-        RequestRedraw();
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        DiscardPendingInk();
+        _presented.Clear();
+        _presenter.StrokeContainer.Clear();
+        _strokes.Clear();
+        RequestViewUpdate();
     }
 
-    /// <summary>
-    /// Sets the zoom level programmatically.
-    /// </summary>
-    /// <param name="zoom">The zoom level (1.0 = 100%).</param>
-    public void SetZoom(float zoom)
+    public void PanBy(float x, float y) => SetViewport(_viewport.AddPan(new Vector2(x, y)));
+
+    public void ZoomAt(float zoom, Vector2 center)
     {
-        Zoom = Math.Clamp(zoom, ViewportState.MinZoom, ViewportState.MaxZoom);
+        if (!float.IsFinite(zoom) || !float.IsFinite(center.X) || !float.IsFinite(center.Y))
+            throw new ArgumentOutOfRangeException(nameof(zoom), "Zoom and focal point must be finite.");
+        SetViewport(_viewport.ZoomAroundPoint(zoom, center));
     }
 
-    /// <summary>
-    /// Resets the viewport to default state (no pan, 100% zoom).
-    /// </summary>
-    public void ResetViewport()
-    {
-        _viewport = ViewportState.Default;
-        _isUpdatingViewport = true;
-        try
-        {
-            PanX = 0;
-            PanY = 0;
-            Zoom = 1.0;
-        }
-        finally
-        {
-            _isUpdatingViewport = false;
-        }
+    public void SetZoom(float zoom) =>
+        ZoomAt(zoom, new Vector2((float)ViewportGrid.ActualWidth / 2, (float)ViewportGrid.ActualHeight / 2));
 
-        if (_inputHandler is not null)
-        {
-            _inputHandler.Viewport = _viewport;
-        }
+    public void ResetViewport() => SetViewport(ViewportState.Default);
 
-        _renderer?.InvalidateStaticContent();
-        RequestRedraw();
-    }
-
-    /// <summary>
-    /// Exports strokes to byte array for persistence.
-    /// </summary>
-    /// <returns>Serialized stroke data.</returns>
     public Task<byte[]> ExportAsync()
     {
-        if (_strokes is null || _strokes.Strokes.Count == 0)
-        {
-            _logger?.LogDebug("ExportAsync: No strokes to save");
-            return Task.FromResult(Array.Empty<byte>());
-        }
-
-        var data = StrokeSerializer.Serialize(_strokes);
-        _logger?.LogDebug("ExportAsync: Serialized {StrokeCount} strokes to {ByteCount} bytes",
-            _strokes.Strokes.Count, data.Length);
-        return Task.FromResult(data);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return Task.FromResult(StrokeSerializer.Serialize(_strokes));
     }
 
-    /// <summary>
-    /// Imports strokes from byte array.
-    /// </summary>
-    /// <param name="data">Serialized stroke data.</param>
     public Task ImportAsync(byte[] data)
     {
-        if (data is null || data.Length == 0)
-        {
-            _logger?.LogDebug("ImportAsync: No ink data provided, clearing canvas");
-            Clear();
-            return Task.CompletedTask;
-        }
-
-        var loadedStrokes = StrokeSerializer.Deserialize(data);
-        _logger?.LogDebug("ImportAsync: Deserialized {StrokeCount} strokes from {ByteCount} bytes",
-            loadedStrokes.Strokes.Count, data.Length);
-
-        if (_strokes is not null)
-        {
-            _strokes.StrokesChanged -= OnStrokesCollectionChanged;
-        }
-
-        _strokes = loadedStrokes;
-        _strokes.StrokesChanged += OnStrokesCollectionChanged;
-
-        RequestRedraw();
+        ArgumentNullException.ThrowIfNull(data);
+        SetStrokes(StrokeSerializer.Deserialize(data));
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Saves ink data asynchronously (alias for <see cref="ExportAsync"/>).
-    /// </summary>
-    /// <returns>Serialized stroke data.</returns>
     public Task<byte[]> SaveInkAsync() => ExportAsync();
-
-    /// <summary>
-    /// Loads ink data asynchronously (alias for <see cref="ImportAsync"/>).
-    /// </summary>
-    /// <param name="inkData">Serialized stroke data.</param>
     public Task LoadInkAsync(byte[] inkData) => ImportAsync(inkData);
-
-    /// <summary>
-    /// Clears all strokes (alias for <see cref="Clear"/>).
-    /// </summary>
     public void ClearStrokes() => Clear();
 
-    /// <summary>
-    /// Adds random strokes for testing by simulating pen input.
-    /// Goes through the full input pipeline including viewport transforms.
-    /// </summary>
-    /// <param name="count">Number of random strokes to add.</param>
     public void AddRandomStrokes(int count)
     {
-        if (_inputHandler is null || !_isInitialized) return;
-
-        var width = (float)Math.Max(100, ActualWidth);
-        var height = (float)Math.Max(100, ActualHeight);
-
-        _inputHandler.SimulateRandomStrokes(count, width, height);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        for (var i = 0; i < count; i++)
+        {
+            var stroke = new Stroke(PenColor.ToStrokeColor(), (float)PenThickness);
+            var screen = new Vector2(
+                Random.Shared.NextSingle() * (float)ViewportGrid.ActualWidth,
+                Random.Shared.NextSingle() * (float)ViewportGrid.ActualHeight);
+            for (var p = 0; p < 20; p++)
+            {
+                screen += new Vector2(Random.Shared.NextSingle() * 30 - 15, Random.Shared.NextSingle() * 30 - 15);
+                stroke.AddPoint(new StrokePoint(_viewport.ScreenToWorld(screen), 0.5f, DateTime.UtcNow.Ticks));
+            }
+            _strokes.Add(stroke);
+            StrokeCompleted?.Invoke(this, new StrokeCompletedEventArgs { Stroke = stroke });
+        }
     }
 
-    #endregion
-
-    /// <inheritdoc/>
     public void Dispose()
     {
-        if (_isDisposed) return;
-        _isDisposed = true;
-
-        if (_inputHandler is not null && _swapChainPanel is not null)
-        {
-            _swapChainPanel.PointerPressed -= _inputHandler.OnPointerPressed;
-            _swapChainPanel.PointerMoved -= _inputHandler.OnPointerMoved;
-            _swapChainPanel.PointerReleased -= _inputHandler.OnPointerReleased;
-            _swapChainPanel.PointerCanceled -= _inputHandler.OnPointerCanceled;
-            _swapChainPanel.PointerWheelChanged -= _inputHandler.OnPointerWheelChanged;
-            _swapChainPanel.PointerEntered -= _inputHandler.OnPointerEntered;
-            _swapChainPanel.PointerExited -= _inputHandler.OnPointerExited;
-
-            _swapChainPanel.ManipulationStarted -= _inputHandler.OnManipulationStarted;
-            _swapChainPanel.ManipulationDelta -= _inputHandler.OnManipulationDelta;
-            _swapChainPanel.ManipulationInertiaStarting -= _inputHandler.OnManipulationInertiaStarting;
-            _swapChainPanel.ManipulationCompleted -= _inputHandler.OnManipulationCompleted;
-
-            _inputHandler.StrokeCompleted -= OnStrokeCompletedHandler;
-            _inputHandler.PanDelta -= OnPanDelta;
-            _inputHandler.ZoomDelta -= OnZoomDelta;
-            _inputHandler.RedrawRequested -= OnRedrawRequested;
-            _inputHandler.StrokeEraseRequested -= OnStrokeEraseRequested;
-        }
-
-        if (_strokes is not null)
-            _strokes.StrokesChanged -= OnStrokesCollectionChanged;
-
-        var deviceManager = DeviceManager.Instance;
-        deviceManager.DeviceLost -= OnDeviceLost;
-        deviceManager.DeviceRestored -= OnDeviceRestored;
-
-        _renderer?.Dispose();
-        _swapChainManager?.Dispose();
-
-        _rootGrid?.Children.Clear();
-        _swapChainPanel = null;
-
-        _isInitialized = false;
+        if (_disposed) return;
+        _disposed = true;
+        CancelQueuedFrame();
+        _haptics.Stop();
+        _presenter.IsInputEnabled = false;
+        _presenter.StrokesCollected -= OnStrokesCollected;
+        _presenter.StrokesErased -= OnStrokesErased;
+        _presenter.StrokeInput.StrokeStarted -= OnStrokeStarted;
+        _presenter.StrokeInput.StrokeEnded -= OnStrokeEnded;
+        _presenter.StrokeInput.StrokeCanceled -= OnStrokeCanceled;
+        _presenter.UnprocessedInput.PointerPressed -= OnUnprocessedPressed;
+        _presenter.UnprocessedInput.PointerMoved -= OnUnprocessedMoved;
+        _presenter.UnprocessedInput.PointerReleased -= OnUnprocessedReleased;
+        _presenter.UnprocessedInput.PointerLost -= OnUnprocessedReleased;
+        Toolbar.ActiveToolChanged -= OnToolbarToolChanged;
+        Toolbar.InkDrawingAttributesChanged -= OnToolbarAttributesChanged;
+        Toolbar.EraseAllClicked -= OnToolbarEraseAll;
+        _strokes.StrokesChanged -= OnStrokesCollectionChanged;
+        ViewportGrid.ReleasePointerCaptures();
+        _touches.Clear();
+        _presented.Clear();
     }
 }

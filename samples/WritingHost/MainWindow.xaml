@@ -72,13 +72,15 @@
             <!-- Divider -->
             <Border Grid.Column="1" Background="{ThemeResource CardStrokeColorDefaultBrush}" Width="1" HorizontalAlignment="Center" />
 
-            <!-- Low-latency ink canvas (D2D swap chain, dedicated render thread) -->
+            <!-- Native WinAppSDK ink over an infinite world-space viewport. -->
             <ink:InkCanvas
                 x:Name="InkSurface"
                 Grid.Column="2"
                 BgType="Blank"
                 BgSpacing="25"
                 PenThickness="2"
+                IsMouseInkingEnabled="True"
+                StrokesChanged="InkSurface_StrokesChanged"
                 ViewportChanged="InkSurface_ViewportChanged" />
         </Grid>
 
@@ -88,7 +90,7 @@
                 <TextBlock x:Name="StatusText" Text="Ready — type on the left, ink on the right"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 <TextBlock Text="•" Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
-                <TextBlock Text="Ctrl+Wheel to zoom ink, Wheel to scroll"
+                <TextBlock Text="Pen/mouse to ink; touch/right-drag to pan; Ctrl+Wheel to zoom"
                            Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
             </StackPanel>
         </Grid>

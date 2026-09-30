@@ -6,7 +6,7 @@ namespace WritingHost;
 
 /// <summary>
 /// Combined host: block-based rich text editor (formatting + inline todos/tags) on the left,
-/// low-latency D2D ink canvas on the right.
+/// native WinAppSDK ink canvas on the right.
 /// </summary>
 public sealed partial class MainWindow : Window
 {
@@ -99,5 +99,11 @@ public sealed partial class MainWindow : Window
     private void InkSurface_ViewportChanged(object sender, InkControl.Controls.ViewportChangedEventArgs e)
     {
         ZoomText.Text = $"{e.Zoom * 100:F0}%";
+    }
+
+    private void InkSurface_StrokesChanged(object? sender, EventArgs e)
+    {
+        if (StatusText is not null)
+            StatusText.Text = $"Ink: {InkSurface.GetStrokes().Strokes.Count} strokes";
     }
 }

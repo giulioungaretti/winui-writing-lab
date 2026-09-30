@@ -1,5 +1,8 @@
 # InkControl Library - Implementation Plan
 
+> Historical plan for the retired Direct2D backend. The library now uses native Windows App SDK
+> 2.5.4-experimental inking; see the repository README for the current architecture and limitations.
+
 ## Overview
 
 Separate the `D2DDrawingSurfaceControl` into an independent WinUI class library (`InkControl`) that can be embedded in any WinUI application. The library will expose:

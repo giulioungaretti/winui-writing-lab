@@ -11,6 +11,10 @@ public partial class App : Application
 
     public App()
     {
+        UnhandledException += (_, args) =>
+            System.IO.File.AppendAllText(
+                System.IO.Path.Combine(AppContext.BaseDirectory, "WritingHost.log"),
+                $"{DateTimeOffset.Now:O} {args.Message}{Environment.NewLine}{args.Exception}{Environment.NewLine}");
         InitializeComponent();
     }
 
