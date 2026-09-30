@@ -25,10 +25,7 @@
                                              MinStrokeWidth="0.1"
                                              MaxStrokeWidth="100"
                                              SelectedStrokeWidth="2" />
-                <InkToolbarEraserButton x:Name="EraserButton"
-                                       SelectedEraser="Stroke"
-                                       IsStrokeEraserVisible="True"
-                                       ArePrecisionErasersVisible="False" />
+                <InkToolbarEraserButton x:Name="EraserButton" />
                 <InkToolbarCustomToolButton x:Name="PanButton"
                                             AutomationProperties.Name="Pan canvas"
                                             ToolTipService.ToolTip="Pan canvas">

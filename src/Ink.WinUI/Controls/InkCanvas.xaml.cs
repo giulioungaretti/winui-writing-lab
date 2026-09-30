@@ -19,7 +19,7 @@ using PointerDeviceType = Microsoft.UI.Input.PointerDeviceType;
 namespace InkControl.Controls;
 
 /// <summary>
-/// Infinite world-space canvas backed entirely by Windows App SDK 2.4.1 native ink.
+/// Infinite world-space canvas backed entirely by Windows App SDK 2.5.4 native ink.
 /// The OS owns both wet and dry ink; only the paper pattern is drawn by the app.
 /// </summary>
 public sealed partial class InkCanvas : UserControl, IDisposable
@@ -171,7 +171,7 @@ public sealed partial class InkCanvas : UserControl, IDisposable
         _presenter.InputProcessingConfiguration.RightDragAction = InkInputRightDragAction.LeaveUnprocessed;
         _presenter.InputConfiguration.IsEraserInputEnabled = true;
         _presenter.InputConfiguration.IsPrimaryBarrelButtonInputEnabled = true;
-        _presenter.SetHighContrastAdjustment(InkHighContrastAdjustment.UseSystemColorsWhenNecessary);
+        _presenter.HighContrastAdjustment = InkHighContrastAdjustment.UseSystemColorsWhenNecessary;
         _presenter.StrokesCollected += OnStrokesCollected;
         _presenter.StrokesErased += OnStrokesErased;
         _presenter.StrokeInput.StrokeStarted += OnStrokeStarted;

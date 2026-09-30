@@ -41,7 +41,7 @@ The smoke test builds and launches `WritingHost`, then drives it through UIA: `i
 
 Known limitation: `winapp ui pen` / `ui touch` raw input injection mistargets on mixed-DPI multi-monitor setups (strokes land in the wrong coordinate space; `ui inspect` reports physical per-monitor pixels while injection consumes a different space). UIA patterns and mouse `click`/`hover` are DPI-safe. Run pen/touch gesture tests on a single-monitor or 100%-scaling machine (e.g. a CI VM); `winapp ui record` can capture MP4 evidence there.
 
-The ink and rich-text libraries and their sample hosts use Windows App SDK **2.4.1-experimental**.
+The ink and rich-text libraries and their sample hosts use Windows App SDK **2.5.4-experimental**.
 Ink targets .NET 10 / Windows 11 (22621); rich text retains its .NET 8 target. The independent
 `InputLatency` Win2D benchmark remains on .NET 8 / Windows App SDK 1.8 and is not the ink backend.
 The sample hosts use `WindowsPackageType=None` and `WindowsAppSDKSelfContained=true`: their build
@@ -79,10 +79,14 @@ serializer source without needing a XAML application: projected coordinates, pen
 selection geometry, timestamp conversion, repeated navigation, GUID preservation and v1/v2 data.
 `Ink.Core.Tests` continues to cover the platform-neutral geometry and historical input processor.
 
-This is an unsupported experimental SDK, pinned intentionally. The August 25 package predates the
-custom-drying API and presenter-size DPI correction in
-[microsoft/microsoft-ui-xaml#11801](https://github.com/microsoft/microsoft-ui-xaml/pull/11801).
-The app clips ink to its viewport, but does not patch the SDK or claim to remove that upstream DPI issue.
-Full brush fidelity and physical pen/touch behavior remain dependent on this experimental runtime.
+This is an unsupported experimental SDK, pinned intentionally. The September 29 package includes
+custom drying (`InkPresenter.ActivateCustomDrying` / `InkSynchronizer`), a custom-drying
+`StrokeContainer` crash fix, and presenter-size corrections in
+[microsoft/microsoft-ui-xaml#11801](https://github.com/microsoft/microsoft-ui-xaml/pull/11801),
+plus the high-DPI right/bottom input cutoff fix in
+[microsoft/microsoft-ui-xaml#11975](https://github.com/microsoft/microsoft-ui-xaml/pull/11975).
+The app deliberately leaves drying native-owned; it does not activate custom drying or patch the SDK.
+Full brush fidelity, physical pen/touch behavior, and transformed-canvas alignment at 150%/200%
+scaling still require hardware/UI validation with this experimental runtime.
 
 Excluded deliberately: notebook/timeline/task models, mobile/server/Aspire, persistence and product shell code, package artifacts, and TypeScript application code.

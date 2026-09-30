@@ -8,7 +8,7 @@
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7175" />
-    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.1-experimental" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.4-experimental" />
   </ItemGroup>
   <ItemGroup><ProjectReference Include="..\..\src\RichText.WinUI\RichText.WinUI.csproj" /></ItemGroup>
 </Project>
