@@ -1,125 +1,131 @@
 <#
 .SYNOPSIS
-    WinApp CLI UI smoke test for the WritingHost sample.
-
+Exercises WritingHost through WinApp CLI UI Automation on the host or in Sandbox.
 .DESCRIPTION
-    Drives the combined rich-text + ink host end-to-end using the Windows App
-    Development CLI (winapp, v0.5+): launches the app, exercises the editor
-    through UIA (invoke/get-value/wait-for), toggles an inline todo checkbox,
-    and captures a screenshot artifact.
-
-    Requires: winget install Microsoft.WinAppCLI  (v0.5.0 or later)
-
-    Note: `winapp ui pen`/`ui touch` raw input injection is unreliable on
-    mixed-DPI multi-monitor setups (strokes land in the wrong coordinate
-    space). This test therefore sticks to UIA patterns and mouse SendInput,
-    which are DPI-safe. Run pen gesture tests on a single-monitor/100%-DPI
-    machine or a CI VM.
-
-.EXAMPLE
-    .\tests\WritingHost.UITests\Invoke-UISmokeTest.ps1
+With -Sandbox, requires WinApp CLI 0.7.0 and an enabled Windows Sandbox on
+Windows 11 24H2+. Never enables features, installs tools, or stops the Sandbox.
+Use -PublishDirectory to test an extracted release without rebuilding it.
 #>
 [CmdletBinding()]
 param(
+    [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Debug',
-    [string]$ArtifactDir = "$PSScriptRoot\artifacts"
+    [string]$ArtifactDir = "$PSScriptRoot\artifacts",
+    [string]$PublishDirectory,
+    [switch]$Sandbox
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Resolve-Path "$PSScriptRoot\..\.."
-$app = 'WritingHost'
-$script:failures = @()
+Set-StrictMode -Version Latest
+$repoRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
+$proc = $null
+$guestPid = $null
+$previousWorkflow = $env:WINAPP_UI_WORKFLOW_ID
+$env:WINAPP_UI_WORKFLOW_ID = "writinghost-smoke-$([guid]::NewGuid())"
+$targetArgs = @()
+if ($Sandbox) { $targetArgs = @('--on', 'sandbox') }
+
+function Invoke-WinApp {
+    param([Parameter(Mandatory)][string[]]$CommandArgs)
+    $output = & winapp @CommandArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "winapp $($CommandArgs -join ' ') failed ($LASTEXITCODE): $($output | Out-String)"
+    }
+    return $output
+}
+
+function Invoke-AppUI {
+    param([Parameter(Mandatory)][string[]]$CommandArgs)
+    Invoke-WinApp -CommandArgs (@('ui') + $CommandArgs + $targetArgs + @('-a', "$appPid"))
+}
 
 function Assert-True([bool]$Condition, [string]$Name) {
-    if ($Condition) {
-        Write-Host "  PASS  $Name" -ForegroundColor Green
-    } else {
-        Write-Host "  FAIL  $Name" -ForegroundColor Red
-        $script:failures += $Name
-    }
+    if (-not $Condition) { throw "FAIL: $Name" }
+    Write-Host "PASS: $Name" -ForegroundColor Green
 }
-
-# --- Preconditions -----------------------------------------------------------
-$winapp = Get-Command winapp -ErrorAction SilentlyContinue
-if (-not $winapp) { throw 'winapp CLI not found. Install with: winget install Microsoft.WinAppCLI' }
-$version = [Version](winapp --version)
-if ($version -lt [Version]'0.5.0') { throw "winapp $version found; v0.5.0+ required. Run: winget upgrade Microsoft.WinAppCLI" }
-
-# --- Build & launch ----------------------------------------------------------
-Write-Host "Building $app..."
-dotnet build "$repoRoot\samples\WritingHost\WritingHost.csproj" --nologo -v q
-if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
-
-$exe = Get-ChildItem "$repoRoot\samples\WritingHost\bin\$Configuration" -Recurse -Filter WritingHost.exe | Select-Object -First 1
-if (-not $exe) { throw "WritingHost.exe not found under bin\$Configuration" }
-
-$existing = Get-Process $app -ErrorAction SilentlyContinue
-if ($existing) { $existing | ForEach-Object { Stop-Process -Id $_.Id }; Start-Sleep 2 }
-
-Write-Host "Launching $($exe.FullName)..."
-$proc = Start-Process $exe.FullName -PassThru
-New-Item -ItemType Directory -Path $ArtifactDir -Force | Out-Null
 
 try {
-    winapp ui wait-for LoadDemoButton -a $app -t 15000 --quiet
-    Assert-True ($LASTEXITCODE -eq 0) 'App window appears'
+    if (-not (Get-Command winapp -ErrorAction SilentlyContinue)) {
+        throw 'WinApp CLI not found. Install with: winget install Microsoft.WinAppCLI'
+    }
+    $version = [Version]((Invoke-WinApp -CommandArgs @('--version') | Out-String).Trim())
+    $minimum = if ($Sandbox) { [Version]'0.7.0' } else { [Version]'0.5.0' }
+    if ($version -lt $minimum) {
+        throw "WinApp CLI $minimum+ required; found $version. Run: winget upgrade Microsoft.WinAppCLI"
+    }
+    New-Item -ItemType Directory -Path $ArtifactDir -Force | Out-Null
+    $ArtifactDir = (Resolve-Path -LiteralPath $ArtifactDir).Path
+    $screenshot = Join-Path $ArtifactDir "writinghost-smoke-$([guid]::NewGuid()).png"
 
-    # --- Load demo document ---------------------------------------------------
-    winapp ui invoke LoadDemoButton -a $app --quiet
-    winapp ui wait-for "An open todo item" -a $app -t 5000 --quiet
-    Assert-True ($LASTEXITCODE -eq 0) 'Demo document renders inline todo items'
+    if ($PublishDirectory) {
+        $PublishDirectory = (Resolve-Path -LiteralPath $PublishDirectory).Path
+        $exe = Join-Path $PublishDirectory 'WritingHost.exe'
+    } else {
+        dotnet build "$repoRoot\samples\WritingHost\WritingHost.csproj" -c $Configuration `
+            -r win-x64 -p:Platform=x64 --nologo -v quiet
+        if ($LASTEXITCODE -ne 0) { throw 'WritingHost build failed.' }
+        $exe = "$repoRoot\samples\WritingHost\bin\x64\$Configuration\net10.0-windows10.0.22621.0\win-x64\WritingHost.exe"
+    }
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "WritingHost.exe not found: $exe" }
 
-    $status = winapp ui get-value StatusText -a $app
-    $statusText = ($status | Out-String).Trim()
-    Assert-True ($statusText -match 'Demo document loaded') "Status reports demo loaded (got: $statusText)"
+    if ($Sandbox) {
+        # Project evaluation identifies the unpackaged app; OutDir selects the exact extracted files.
+        $launch = Invoke-WinApp -CommandArgs @(
+            'run', "$repoRoot\samples\WritingHost\WritingHost.csproj",
+            '--on', 'sandbox', '--detach', '--json', '--no-build', '--no-restore',
+            '--configuration', $Configuration, '--runtime', 'win-x64',
+            '--property', "OutDir=$(Split-Path -Parent $exe)\",
+            '--property', "SelfContained=$([bool]$PublishDirectory)",
+            '--property', "PortableRelease=$([bool]$PublishDirectory)"
+        ) | Out-String | ConvertFrom-Json
+        if (-not $launch.Sandbox -or $launch.ProcessScope -ne 'sandbox') {
+            throw 'WinApp did not report a Sandbox-scoped process. Refusing host UI fallback.'
+        }
+        $guestPid = [int]$launch.ProcessId
+        $appPid = $guestPid
+    } else {
+        $proc = Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -PassThru
+        $appPid = $proc.Id
+    }
 
-    # Inline tag chips render as UIA text elements
-    $tags = winapp ui search '#demo' -a $app 2>&1 | Out-String
-    Assert-True ($tags -match 'demo') 'Inline #demo tag chip is present'
+    Invoke-AppUI -CommandArgs @('wait-for', 'LoadDemoButton', '-t', '15000', '--quiet') | Out-Null
+    Write-Host 'PASS: App window appears' -ForegroundColor Green
+    Invoke-AppUI -CommandArgs @('invoke', 'LoadDemoButton', '--quiet') | Out-Null
+    Invoke-AppUI -CommandArgs @('wait-for', 'An open todo item', '-t', '5000', '--quiet') | Out-Null
+    $status = Invoke-AppUI -CommandArgs @('get-value', 'StatusText') | Out-String
+    Assert-True ($status -match 'Demo document loaded') 'Demo document loaded'
+    $tags = Invoke-AppUI -CommandArgs @('search', '#demo') | Out-String
+    Assert-True ($tags -match 'demo') 'Inline tag chip is present'
+    $image = Invoke-AppUI -CommandArgs @('search', 'lab sketch') | Out-String
+    Assert-True ($image -match 'lab sketch') 'Demo image is present'
 
-    # Inline image exposes its alt text through automation
-    $img = winapp ui search 'lab sketch' -a $app 2>&1 | Out-String
-    Assert-True ($img -match 'lab sketch') 'Inline image (alt text) is present'
+    $tree = Invoke-AppUI -CommandArgs @('inspect', 'window', '--depth', '8') | Out-String
+    $checkbox = [regex]::Match($tree, '(chk-[0-9a-f]+) CheckBox \[off\]').Groups[1].Value
+    Assert-True ($checkbox -ne '') 'Unchecked todo checkbox found'
+    Invoke-AppUI -CommandArgs @('invoke', $checkbox, '--quiet') | Out-Null
+    $tree = Invoke-AppUI -CommandArgs @('inspect', 'window', '--depth', '8') | Out-String
+    Assert-True ($tree -match "$checkbox CheckBox \[on\]") 'Todo checkbox toggles'
 
-    # --- Toggle an inline todo checkbox (TogglePattern) -----------------------
-    $before = (winapp ui search 'An open todo item' -a $app 2>&1 | Out-String)
-    Assert-True ($before -match 'An open todo item') 'Open todo found before toggle'
-
-    $tree = winapp ui inspect window -a $app --depth 8 2>&1 | Out-String
-    $chk = [regex]::Match($tree, '(chk-[0-9a-f]+) CheckBox \[off\]').Groups[1].Value
-    Assert-True ($chk -ne '') "Found unchecked checkbox slug ($chk)"
-
-    winapp ui invoke $chk -a $app --quiet
-    Start-Sleep 1
-    $treeAfter = winapp ui inspect window -a $app --depth 8 2>&1 | Out-String
-    Assert-True ($treeAfter -match "$chk CheckBox \[on\]") "Todo checkbox toggled to [on] via TogglePattern"
-
-    # --- Append a todo via toolbar --------------------------------------------
-    winapp ui invoke InsertTodoButton -a $app --quiet
-    winapp ui wait-for 'New todo' -a $app -t 5000 --quiet
-    Assert-True ($LASTEXITCODE -eq 0) 'Insert Todo appends a new todo block'
-
-    # --- Ink toolbar reachable -------------------------------------------------
-    winapp ui invoke ClearInkButton -a $app --quiet
-    Start-Sleep 1
-    $status = winapp ui get-value StatusText -a $app
-    $statusText = ($status | Out-String).Trim()
-    Assert-True ($statusText -match 'Ink cleared') "Clear Ink reachable via UIA (got: $statusText)"
-
-    # --- Screenshot artifact ----------------------------------------------------
-    winapp ui screenshot window -a $app --output "$ArtifactDir\writinghost-smoke.png" --quiet
-    Assert-True (Test-Path "$ArtifactDir\writinghost-smoke.png") 'Screenshot artifact captured'
+    Invoke-AppUI -CommandArgs @('invoke', 'InsertTodoButton', '--quiet') | Out-Null
+    Invoke-AppUI -CommandArgs @('wait-for', 'New todo', '-t', '5000', '--quiet') | Out-Null
+    Invoke-AppUI -CommandArgs @('invoke', 'ClearInkButton', '--quiet') | Out-Null
+    $status = Invoke-AppUI -CommandArgs @('get-value', 'StatusText') | Out-String
+    Assert-True ($status -match 'Ink cleared') 'Ink toolbar is reachable'
+    Invoke-AppUI -CommandArgs @('screenshot', 'window', '--output', $screenshot, '--quiet') | Out-Null
+    Assert-True (Test-Path -LiteralPath $screenshot) 'Screenshot captured'
+    Write-Host 'UI smoke test PASSED' -ForegroundColor Green
 }
 finally {
-    if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id }
-}
-
-# --- Summary -----------------------------------------------------------------
-Write-Host ''
-if ($script:failures.Count -eq 0) {
-    Write-Host 'UI smoke test PASSED' -ForegroundColor Green
-    exit 0
-} else {
-    Write-Host "UI smoke test FAILED ($($script:failures.Count)): $($script:failures -join '; ')" -ForegroundColor Red
-    exit 1
+    try {
+        if ($guestPid) {
+            Invoke-WinApp -CommandArgs @(
+                'target', 'exec', 'sandbox', '--', 'powershell.exe', '-NoProfile', '-Command',
+                "if (Get-Process -Id $guestPid -ErrorAction SilentlyContinue) { Stop-Process -Id $guestPid }"
+            ) | Out-Null
+        }
+        if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id }
+    }
+    finally {
+        $env:WINAPP_UI_WORKFLOW_ID = $previousWorkflow
+    }
 }

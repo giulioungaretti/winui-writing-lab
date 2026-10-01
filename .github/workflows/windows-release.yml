@@ -1,0 +1,179 @@
+name: Windows build and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Select release version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $version = if ($env:REF_TYPE -eq 'tag') { $env:REF_NAME -replace '^v', '' } else { "0.0.0-ci.$env:GITHUB_RUN_NUMBER" }
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$') { throw "Invalid release version: $version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Test core libraries
+        run: |
+          dotnet test tests\Ink.Core.Tests\Ink.Core.Tests.csproj -c Release --nologo -v quiet
+          if ($LASTEXITCODE -ne 0) { throw 'Ink.Core tests failed.' }
+          dotnet test tests\RichText.Core.Tests\RichText.Core.Tests.csproj -c Release --nologo -v quiet
+          if ($LASTEXITCODE -ne 0) { throw 'RichText.Core tests failed.' }
+      - name: Test release scripts
+        run: .\tests\Release.Tests\Invoke-ReleaseTests.ps1
+      - name: Build other sample hosts
+        run: |
+          foreach ($project in @('samples\InkHost\InkHost.csproj', 'samples\RichTextHost\RichTextHost.csproj', 'benchmarks\InputLatency\InputLatency.csproj')) {
+            dotnet build $project -c Release -p:Platform=x64 --nologo -v quiet
+            if ($LASTEXITCODE -ne 0) { throw "Build failed: $project" }
+          }
+      - name: Publish portable layout
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: .\scripts\Publish-WritingHost.ps1 -Version $env:RELEASE_VERSION -PublishOnly
+      - name: Azure signing login
+        if: startsWith(github.ref, 'refs/tags/') && vars.ARTIFACT_SIGNING_ENABLED == 'true'
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Sign application binaries
+        if: startsWith(github.ref, 'refs/tags/') && vars.ARTIFACT_SIGNING_ENABLED == 'true'
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\artifacts\release\WritingHost-${{ steps.version.outputs.version }}-win-x64
+          files-folder-filter: WritingHost.exe,WritingHost.dll,Ink.Core.dll,Ink.WinUI.dll,RichText.Core.dll,RichText.WinUI.dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Archive and verify signatures
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          REQUIRE_SIGNED: ${{ startsWith(github.ref, 'refs/tags/') && vars.ARTIFACT_SIGNING_ENABLED == 'true' }}
+        run: |
+          .\scripts\Publish-WritingHost.ps1 -Version $env:RELEASE_VERSION -ArchiveOnly -RequireSigned:($env:REQUIRE_SIGNED -eq 'true')
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: WritingHost-win-x64
+          path: |
+            artifacts\release\*.zip
+            artifacts\release\*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  sandbox:
+    needs: build
+    if: github.event_name != 'pull_request' && vars.WINDOWS_SANDBOX_ENABLED == 'true'
+    runs-on: [self-hosted, Windows, X64, windows-sandbox]
+    timeout-minutes: 15
+    concurrency:
+      group: writinghost-windows-sandbox
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: WritingHost-win-x64
+          path: artifacts\release
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.x
+      - uses: microsoft/setup-WinAppCli@b93bbddc1f7abc061ca0d3a8119e3a0c7dd71495 # v0.2
+        with:
+          version: v0.7.0
+      - name: Verify and test downloaded ZIP in Sandbox
+        env:
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          WINAPP_CLI_TELEMETRY_OPTOUT: '1'
+        run: |
+          $name = "WritingHost-$env:RELEASE_VERSION-win-x64"
+          $zip = "artifacts\release\$name.zip"
+          $expected = (Get-Content "$zip.sha256").Split(' ')[0]
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Release checksum mismatch.' }
+          $destination = "artifacts\sandbox-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          Expand-Archive -LiteralPath $zip -DestinationPath $destination
+          .\tests\WritingHost.UITests\Invoke-UISmokeTest.ps1 -Sandbox -PublishDirectory "$destination\$name" -ArtifactDir "$destination\evidence"
+      - name: Upload Sandbox evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: WritingHost-sandbox-evidence
+          path: artifacts\sandbox-*\evidence
+          if-no-files-found: warn
+
+  release:
+    needs: [build, sandbox]
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/') &&
+      needs.build.result == 'success' &&
+      (needs.sandbox.result == 'success' ||
+       (needs.sandbox.result == 'skipped' && vars.WINDOWS_SANDBOX_ENABLED != 'true'))
+    runs-on: windows-2025
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: WritingHost-win-x64
+          path: artifacts\release
+      - name: Publish research prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SIGNED: ${{ vars.ARTIFACT_SIGNING_ENABLED == 'true' }}
+          SANDBOX_TESTED: ${{ needs.sandbox.result == 'success' }}
+        run: |
+          @"
+          Windows x64 research sample. Requires Windows 11 22H2 (build 22621) or newer.
+          Download the WritingHost ZIP (not GitHub's source archive), extract all files, and open WritingHost.exe.
+          .NET and Windows App SDK runtimes are bundled. Updates are manual.
+
+          Trusted, timestamped application signing: $env:SIGNED
+          Sandbox UI smoke test completed: $env:SANDBOX_TESTED
+          Unsigned prereleases may be blocked by Windows security policy. Signing does not guarantee SmartScreen reputation.
+          Sandbox smoke testing does not certify browser-download security behavior or every supported Windows version.
+          Verify the ZIP using the accompanying SHA-256 checksum.
+          "@ | Set-Content artifacts\release\notes.txt
+          $assets = @(Get-ChildItem artifacts\release -File | Where-Object { $_.Name -match '\.(zip|sha256)$' } | ForEach-Object FullName)
+          gh release create $env:RELEASE_TAG @assets --verify-tag --prerelease --title "WritingHost $env:RELEASE_TAG (research preview)" --notes-file artifacts\release\notes.txt
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub prerelease publication failed.' }

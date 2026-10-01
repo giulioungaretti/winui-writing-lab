@@ -4,6 +4,11 @@
     <RootNamespace>WritingHost</RootNamespace><ApplicationManifest>app.manifest</ApplicationManifest><UseWinUI>true</UseWinUI><WinUISDKReferences>false</WinUISDKReferences>
     <WindowsPackageType>None</WindowsPackageType><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(PortableRelease)' == 'true'">
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7175" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.251106002" />
@@ -13,6 +18,13 @@
     <ProjectReference Include="..\..\src\RichText.WinUI\RichText.WinUI.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <Content Include="Assets\demo-sketch.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\demo-sketch.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+  <!-- The unpackaged SDK copies these to build output but omits them from dotnet publish. -->
+  <Target Name="PublishPortableXamlResources" AfterTargets="Publish" Condition="'$(PortableRelease)' == 'true'">
+    <ItemGroup>
+      <_PortableXamlFiles Include="$(TargetDir)$(AssemblyName).pri;$(TargetDir)**\*.xbf" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_PortableXamlFiles)" DestinationFolder="$(PublishDir)%(_PortableXamlFiles.RecursiveDir)" SkipUnchangedFiles="true" />
+  </Target>
 </Project>
